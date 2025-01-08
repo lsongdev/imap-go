@@ -205,173 +205,118 @@ func dropNl(b []byte) []byte {
 
 var atom = regexp.MustCompile(`{\d+}$`)
 
-// Exec executes the command on the imap connection
-func (d *Client) Exec(command string) (response string, err error) {
-	var resp strings.Builder
+// Exec executes a command on the IMAP connection and returns the response
+// It handles the complete IMAP command execution flow including:
+// - Sending the command with a unique tag
+// - Reading the response including handling literals
+// - Parsing the response status
+func (c *Client) Exec(command string) (string, error) {
+	// Generate unique command tag
 	tag := []byte(fmt.Sprintf("%X", xid.New()))
-	c := fmt.Sprintf("%s %s\r\n", tag, command)
-	_, err = d.conn.Write([]byte(c))
-	if err != nil {
-		return
+	// Send command
+	if err := c.sendCommand(tag, command); err != nil {
+		return "", fmt.Errorf("failed to send command: %w", err)
 	}
+	// Read and process response
+	response, err := c.readResponse(tag)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	return response, nil
+}
+
+// sendCommand writes a tagged command to the IMAP server
+func (c *Client) sendCommand(tag []byte, command string) error {
+	cmdStr := fmt.Sprintf("%s %s\r\n", tag, command)
+
+	if _, err := c.conn.Write([]byte(cmdStr)); err != nil {
+		return err
+	}
+
 	log.Println("[IMAP] ->", command)
-	r := bufio.NewReader(d.conn)
-	resp = strings.Builder{}
-	var line []byte
-	for err == nil {
-		line, err = r.ReadBytes('\n')
-		for {
-			if a := atom.Find(dropNl(line)); a != nil {
-				var n int
-				n, err = strconv.Atoi(string(a[1 : len(a)-1]))
-				if err != nil {
-					return
-				}
+	return nil
+}
 
-				buf := make([]byte, n)
-				_, err = io.ReadFull(r, buf)
-				if err != nil {
-					return
-				}
-				line = append(line, buf...)
+// readResponse reads the complete response for a command from the IMAP server
+func (c *Client) readResponse(tag []byte) (string, error) {
+	reader := bufio.NewReader(c.conn)
+	var response strings.Builder
 
-				buf, err = r.ReadBytes('\n')
-				if err != nil {
-					return
-				}
-				line = append(line, buf...)
+	for {
+		// Read next line
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return "", err
+		}
 
-				continue
+		// Handle literals in the response
+		line, err = c.handleLiterals(line, reader)
+		if err != nil {
+			return "", err
+		}
+
+		// Check if this is the tagged response line
+		if isTaggedResponse(line, tag) {
+			if err := checkStatus(line, tag); err != nil {
+				return "", err
 			}
 			break
 		}
 
-		// XID project is returning 40-byte tags. The code was originally hardcoded 16 digits.
-		taglen := len(tag)
-		oklen := 3
-		if len(line) >= taglen+oklen && bytes.Equal(line[:taglen], tag) {
-			if !bytes.Equal(line[taglen+1:taglen+oklen], []byte("OK")) {
-				err = fmt.Errorf("imap command failed: %s", line[taglen+oklen+1:])
-				return
-			}
+		response.Write(line)
+	}
+
+	return response.String(), nil
+}
+
+// handleLiterals processes any literal strings in an IMAP response line
+func (c *Client) handleLiterals(line []byte, reader *bufio.Reader) ([]byte, error) {
+	for {
+		literal := atom.Find(dropNl(line))
+		if literal == nil {
 			break
 		}
 
-		resp.Write(line)
+		// Parse literal size
+		size, err := strconv.Atoi(string(literal[1 : len(literal)-1]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid literal size: %w", err)
+		}
+
+		// Read literal content
+		content := make([]byte, size)
+		if _, err := io.ReadFull(reader, content); err != nil {
+			return nil, fmt.Errorf("failed to read literal: %w", err)
+		}
+		line = append(line, content...)
+
+		// Read the rest of the line
+		rest, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read after literal: %w", err)
+		}
+		line = append(line, rest...)
 	}
-	response = resp.String()
-	// log.Println("[IMAP] <-", response)
-	return
+
+	return line, nil
 }
 
-// GetFolders returns all folders
-// GetFolders returns all available folders/mailboxes
-func (d *Client) GetFolders() ([]string, error) {
-	resp, err := d.Exec(`LIST "" "*"`)
-	if err != nil {
-		return nil, fmt.Errorf("LIST command failed: %w", err)
-	}
-
-	var folders []string
-	lines := strings.Split(resp, "\r\n")
-
-	// 正则表达式用于匹配 LIST 响应的各个部分
-	// 格式: * LIST (\Flags) "Separator" "Folder Name"
-	listRegex := regexp.MustCompile(`^\* LIST \((.*?)\) "(.?)" "(.+)"$`)
-
-	for _, line := range lines {
-		// 跳过空行和标签行
-		if line == "" || !strings.HasPrefix(line, "* LIST") {
-			continue
-		}
-
-		// 处理未加引号的简单格式
-		if !strings.Contains(line, `"`) {
-			parts := strings.Split(line, " ")
-			if len(parts) >= 4 {
-				folder := parts[len(parts)-1]
-				folders = append(folders, RemoveSlashes.Replace(folder))
-			}
-			continue
-		}
-
-		// 处理标准的带引号格式
-		matches := listRegex.FindStringSubmatch(line)
-		if len(matches) == 4 {
-			folderName := matches[3]
-			// 处理 IMAP 文件夹名称中的特殊字符
-			folderName = RemoveSlashes.Replace(folderName)
-			folders = append(folders, folderName)
-			continue
-		}
-
-		// 处理包含特殊字符的复杂格式
-		// 例如: * LIST (\HasNoChildren) "/" "INBOX/Reports & Updates"
-		start := strings.LastIndex(line, `"`)
-		if start > 0 {
-			folderName := line[start+1 : len(line)-1]
-			folderName = RemoveSlashes.Replace(folderName)
-			folders = append(folders, folderName)
-		}
-	}
-
-	return folders, nil
+// isTaggedResponse checks if a response line is the tagged status response
+func isTaggedResponse(line []byte, tag []byte) bool {
+	return len(line) >= len(tag) && bytes.Equal(line[:len(tag)], tag)
 }
 
-// SelectFolder selects a folder
-func (d *Client) SelectFolder(folder string) (err error) {
-	_, err = d.Exec(`EXAMINE "` + AddSlashes.Replace(folder) + `"`)
-	if err != nil {
-		return
+// checkStatus verifies the status in a tagged response line
+func checkStatus(line []byte, tag []byte) error {
+	// Skip tag and space
+	pos := len(tag) + 1
+
+	// Check for "OK" status
+	if len(line) < pos+2 || !bytes.Equal(line[pos:pos+2], []byte("OK")) {
+		return fmt.Errorf("command failed: %s", line[pos+3:])
 	}
-	// d.Folder = folder
+
 	return nil
-}
-
-// Move a read email to a specified folder
-func (d *Client) MoveEmail(uid int, folder string) (err error) {
-	_, err = d.Exec(`UID MOVE ` + strconv.Itoa(uid) + ` "` + AddSlashes.Replace(folder) + `"`)
-	if err != nil {
-		return
-	}
-	// d.Folder = folder
-	return nil
-}
-
-// Search returns the UIDs in the current folder that match the search criteria
-func (d *Client) Search(filter string) ([]int, error) {
-	// Execute the UID SEARCH command
-	r, err := d.Exec("UID SEARCH " + filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute UID SEARCH: %w", err)
-	}
-
-	// Parse the response to extract UIDs
-	var uids []int
-	lines := strings.Split(r, "\r\n")
-
-	for _, line := range lines {
-		// Skip empty lines
-		if len(line) == 0 {
-			continue
-		}
-
-		// Look for lines starting with "* SEARCH"
-		if !strings.HasPrefix(line, "* SEARCH") {
-			continue
-		}
-
-		// Split the line into fields and parse UIDs
-		fields := strings.Fields(line)[2:] // Skip "* SEARCH"
-		for _, field := range fields {
-			uid, err := strconv.Atoi(field)
-			if err != nil {
-				continue // Skip invalid numbers
-			}
-			uids = append(uids, uid)
-		}
-	}
-	return uids, nil
 }
 
 const (
@@ -424,18 +369,73 @@ const (
 	TContainer
 )
 
-// TimeFormat is the Go time version of the IMAP times
-const TimeFormat = "_2-Jan-2006 15:04:05 -0700"
+// IsLiteral returns if the given byte is an acceptable literal character
+func IsLiteral(b rune) bool {
+	switch {
+	case unicode.IsDigit(b),
+		unicode.IsLetter(b),
+		b == '\\',
+		b == '.',
+		b == '[',
+		b == ']':
+		return true
+	}
+	return false
+}
+
+// GetTokenName returns the name of the given token type token
+func (t TType) GetTokenName() string {
+	switch t {
+	case TUnset:
+		return "TUnset"
+	case TAtom:
+		return "TAtom"
+	case TNumber:
+		return "TNumber"
+	case TLiteral:
+		return "TLiteral"
+	case TQuoted:
+		return "TQuoted"
+	case TNil:
+		return "TNil"
+	case TContainer:
+		return "TContainer"
+	}
+	return ""
+}
+
+func (t Token) String() string {
+	tokenType := t.Type.GetTokenName()
+	switch t.Type {
+	case TUnset, TNil:
+		return tokenType
+	case TAtom, TQuoted:
+		return fmt.Sprintf("(%s, len %d, chars %d %#v)", tokenType, len(t.Str), len([]rune(t.Str)), t.Str)
+	case TNumber:
+		return fmt.Sprintf("(%s %d)", tokenType, t.Num)
+	case TLiteral:
+		return fmt.Sprintf("(%s %s)", tokenType, t.Str)
+	case TContainer:
+		return fmt.Sprintf("(%s children: %s)", tokenType, t.Tokens)
+	}
+	return ""
+}
 
 type tokenContainer *[]*Token
 
-func (c *Client) Fetch(cmd string) (records [][]*Token, err error) {
+// TimeFormat is the Go time version of the IMAP times
+const TimeFormat = "_2-Jan-2006 15:04:05 -0700"
+
+func (c *Client) Fetch(cmd string) (map[int]*Message, error) {
 	resp, err := c.Exec(cmd)
 	if err != nil {
-		return
+		return nil, err
 	}
-	records, err = c.parseFetchResponse(resp)
-	return
+	records, err := c.parseFetchResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	return c.decodeRecords(records)
 }
 
 // ParseFetchResponse parses a response from a FETCH command into tokens
@@ -594,58 +594,6 @@ func (d *Client) parseFetchResponse(r string) (records [][]*Token, err error) {
 	}
 
 	return
-}
-
-// IsLiteral returns if the given byte is an acceptable literal character
-func IsLiteral(b rune) bool {
-	switch {
-	case unicode.IsDigit(b),
-		unicode.IsLetter(b),
-		b == '\\',
-		b == '.',
-		b == '[',
-		b == ']':
-		return true
-	}
-	return false
-}
-
-// GetTokenName returns the name of the given token type token
-func (t TType) GetTokenName() string {
-	switch t {
-	case TUnset:
-		return "TUnset"
-	case TAtom:
-		return "TAtom"
-	case TNumber:
-		return "TNumber"
-	case TLiteral:
-		return "TLiteral"
-	case TQuoted:
-		return "TQuoted"
-	case TNil:
-		return "TNil"
-	case TContainer:
-		return "TContainer"
-	}
-	return ""
-}
-
-func (t Token) String() string {
-	tokenType := t.Type.GetTokenName()
-	switch t.Type {
-	case TUnset, TNil:
-		return tokenType
-	case TAtom, TQuoted:
-		return fmt.Sprintf("(%s, len %d, chars %d %#v)", tokenType, len(t.Str), len([]rune(t.Str)), t.Str)
-	case TNumber:
-		return fmt.Sprintf("(%s %d)", tokenType, t.Num)
-	case TLiteral:
-		return fmt.Sprintf("(%s %s)", tokenType, t.Str)
-	case TContainer:
-		return fmt.Sprintf("(%s children: %s)", tokenType, t.Tokens)
-	}
-	return ""
 }
 
 // checkType validates a type against a list of acceptable types,
@@ -841,26 +789,127 @@ func (d *Client) decodeRecords(records [][]*Token) (emails map[int]*Message, err
 	return
 }
 
-// GetOverviews returns emails without bodies for the given UIDs in the current folder.
-// If no UIDs are given, then everything in the current folder is selected
-func (d *Client) GetOverviews(uids ...int) (emails map[int]*Message, err error) {
-	uidsStr := numbersJoin(uids, ",")
-	records, err := d.Fetch("UID FETCH " + uidsStr + " ALL")
+// GetFolders returns all available folders/mailboxes
+func (d *Client) GetFolders() ([]string, error) {
+	resp, err := d.Exec(`LIST "" "*"`)
+	if err != nil {
+		return nil, fmt.Errorf("LIST command failed: %w", err)
+	}
+
+	var folders []string
+	lines := strings.Split(resp, "\r\n")
+
+	// 正则表达式用于匹配 LIST 响应的各个部分
+	// 格式: * LIST (\Flags) "Separator" "Folder Name"
+	listRegex := regexp.MustCompile(`^\* LIST \((.*?)\) "(.?)" "(.+)"$`)
+
+	for _, line := range lines {
+		// 跳过空行和标签行
+		if line == "" || !strings.HasPrefix(line, "* LIST") {
+			continue
+		}
+
+		// 处理未加引号的简单格式
+		if !strings.Contains(line, `"`) {
+			parts := strings.Split(line, " ")
+			if len(parts) >= 4 {
+				folder := parts[len(parts)-1]
+				folders = append(folders, RemoveSlashes.Replace(folder))
+			}
+			continue
+		}
+
+		// 处理标准的带引号格式
+		matches := listRegex.FindStringSubmatch(line)
+		if len(matches) == 4 {
+			folderName := matches[3]
+			// 处理 IMAP 文件夹名称中的特殊字符
+			folderName = RemoveSlashes.Replace(folderName)
+			folders = append(folders, folderName)
+			continue
+		}
+
+		// 处理包含特殊字符的复杂格式
+		// 例如: * LIST (\HasNoChildren) "/" "INBOX/Reports & Updates"
+		start := strings.LastIndex(line, `"`)
+		if start > 0 {
+			folderName := line[start+1 : len(line)-1]
+			folderName = RemoveSlashes.Replace(folderName)
+			folders = append(folders, folderName)
+		}
+	}
+
+	return folders, nil
+}
+
+// SelectFolder selects a folder
+func (d *Client) SelectFolder(folder string) (err error) {
+	_, err = d.Exec(`EXAMINE "` + AddSlashes.Replace(folder) + `"`)
 	if err != nil {
 		return
 	}
-	return d.decodeRecords(records)
+	// d.Folder = folder
+	return nil
+}
+
+// Move a read email to a specified folder
+func (d *Client) MoveEmail(uid int, folder string) (err error) {
+	_, err = d.Exec(`UID MOVE ` + strconv.Itoa(uid) + ` "` + AddSlashes.Replace(folder) + `"`)
+	if err != nil {
+		return
+	}
+	// d.Folder = folder
+	return nil
+}
+
+// Search returns the UIDs in the current folder that match the search criteria
+func (d *Client) Search(filter string) ([]int, error) {
+	// Execute the UID SEARCH command
+	r, err := d.Exec("UID SEARCH " + filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute UID SEARCH: %w", err)
+	}
+
+	// Parse the response to extract UIDs
+	var uids []int
+	lines := strings.Split(r, "\r\n")
+
+	for _, line := range lines {
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		// Look for lines starting with "* SEARCH"
+		if !strings.HasPrefix(line, "* SEARCH") {
+			continue
+		}
+
+		// Split the line into fields and parse UIDs
+		fields := strings.Fields(line)[2:] // Skip "* SEARCH"
+		for _, field := range fields {
+			uid, err := strconv.Atoi(field)
+			if err != nil {
+				continue // Skip invalid numbers
+			}
+			uids = append(uids, uid)
+		}
+	}
+	return uids, nil
+}
+
+// GetOverviews returns emails without bodies for the given UIDs in the current folder.
+// If no UIDs are given, then everything in the current folder is selected
+func (d *Client) GetOverviews(uids ...int) (map[int]*Message, error) {
+	uidsStr := numbersJoin(uids, ",")
+	return d.Fetch("UID FETCH " + uidsStr + " ALL")
 }
 
 // GetEmails returns email with their bodies for the given UIDs in the current folder.
 // If no UIDs are given, then everything in the current folder is selected
 func (d *Client) GetEmails(uids ...int) (emails map[int]*Message, err error) {
 	uidsStr := numbersJoin(uids, ",")
-	records, err := d.Fetch("UID FETCH " + uidsStr + " BODY.PEEK[]")
-	if err != nil {
-		return
-	}
-	emails, err = d.decodeRecords(records)
+	emails, err = d.Fetch("UID FETCH " + uidsStr + " BODY.PEEK[]")
 	if err != nil {
 		return
 	}

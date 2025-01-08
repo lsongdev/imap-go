@@ -49,14 +49,17 @@ func main() {
 	// You can enter things like "*:1" to get the first UID, or "999999999:*"
 	// to get the last (unless you actually have more than that many emails)
 	// You can check out https://tools.ietf.org/html/rfc3501#section-6.4.4 for more
-	uids, err := client.Search("ALL")
+	filter := imap.SearchFilter{
+		WithoutFlags: []string{imap.FlagSeen},
+	}
+	uids, err := client.Search(filter.String())
 	check(err)
 
 	// uids = []int{1, 2, 3}
-	emails, err := client.GetEmails(uids[0:100]...)
+	emails, err := client.GetEmails(uids...)
 	check(err)
 
 	for _, e := range emails {
-		log.Println(e)
+		log.Println(e.Subject)
 	}
 }
